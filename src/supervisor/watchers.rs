@@ -741,9 +741,10 @@ impl Supervisor {
     ///
     /// Also removes stale `config_registered` entries for daemons whose cron
     /// config has been removed, so they stop firing.
-    async fn register_config_cron_daemons(&self) -> Result<()> {
-        let config = PitchforkToml::all_merged_all_namespaces()?;
-
+    ///
+    /// `config` is the merged config of every known project, read by the
+    /// caller.
+    async fn register_config_cron_daemons(&self, config: &PitchforkToml) -> Result<()> {
         let config_cron_ids: HashSet<&DaemonId> = config
             .daemons
             .iter()
@@ -817,11 +818,20 @@ impl Supervisor {
         // can see them. Without this, daemons defined in config with `cron`
         // but never started (no `boot_start`, no manual `pitchfork start`)
         // are invisible to the cron checker.
-        self.register_config_cron_daemons().await?;
+        //
+        // The config of every known project is read once per check, for both
+        // this and the sync below. Reading it walks the filesystem, so it runs
+        // on a blocking worker rather than holding up the watcher.
+        let config =
+            match tokio::task::spawn_blocking(PitchforkToml::all_merged_all_namespaces).await {
+                Ok(config) => std::sync::Arc::new(config?),
+                Err(e) => miette::bail!("reading config for the cron check panicked: {e}"),
+            };
+        self.register_config_cron_daemons(&config).await?;
 
         // Bring the schedules stored in state in line with config first, so
         // the checks below fire each daemon by the schedule it has now.
-        self.sync_cron_schedules_with_config().await;
+        self.sync_cron_schedules_with_config(config).await;
 
         let now = chrono::Local::now();
 
@@ -1020,7 +1030,9 @@ impl Supervisor {
     /// expression, a new `retrigger`, removing it, adding it back — would not
     /// reach a daemon that had been started until it was started again.
     /// Ad-hoc runs have no schedule, so every stored one came from config.
-    async fn sync_cron_schedules_with_config(&self) {
+    ///
+    /// `all` is the merged config of every known project, read by the caller.
+    async fn sync_cron_schedules_with_config(&self, all: std::sync::Arc<PitchforkToml>) {
         let daemons: Vec<(DaemonId, Option<PathBuf>)> = {
             let state = self.state_file.lock().await;
             state
@@ -1029,14 +1041,14 @@ impl Supervisor {
                 .map(|(id, d)| (id.clone(), d.dir.clone()))
                 .collect()
         };
-        // Reading config walks the filesystem, so it runs on a blocking worker
-        // rather than holding up the watcher.
+        // Each daemon's own project config is read from its working
+        // directory, which walks the filesystem, so it runs on a blocking
+        // worker rather than holding up the watcher.
         let found = match tokio::task::spawn_blocking(move || {
-            let all = PitchforkToml::all_merged_all_namespaces().ok();
             daemons
                 .into_iter()
                 .map(|(id, dir)| {
-                    let cron = config_cron(&id, dir.as_deref(), all.as_ref());
+                    let cron = config_cron(&id, dir.as_deref(), Some(&all));
                     (id, cron)
                 })
                 .collect::<Vec<_>>()
