@@ -14,7 +14,7 @@ use crate::{env, pitchfork_toml, template};
 use indexmap::IndexMap;
 use miette::IntoDiagnostic;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The type of lifecycle hook to fire
 #[allow(clippy::enum_variant_names)]
@@ -51,6 +51,15 @@ fn get_hook_cmd(
     })
 }
 
+/// Where to read a daemon's hooks from: the directory of the config that
+/// defines it, which its record keeps, rather than its working directory,
+/// which `dir` can put outside the project where that config is not found.
+fn hook_config_root(record: Option<&crate::daemon::Daemon>, daemon_dir: &Path) -> PathBuf {
+    record
+        .and_then(|d| d.watch_base_dir.clone())
+        .unwrap_or_else(|| daemon_dir.to_path_buf())
+}
+
 async fn load_hook_config(daemon_dir: PathBuf) -> Result<PitchforkToml> {
     tokio::task::spawn_blocking(move || PitchforkToml::all_merged_all_namespaces_from(&daemon_dir))
         .await
@@ -85,7 +94,7 @@ fn inject_port_env(command: &mut tokio::process::Command, resolved_ports: &[u16]
 
 /// Fire a hook command as a fire-and-forget tokio task.
 ///
-/// Reads the hook command from fresh config rooted at the daemon's directory,
+/// Reads the hook command from fresh config rooted at the daemon's project,
 /// then spawns it in the background. Errors are logged but never block the caller.
 ///
 /// `resolved_ports` must be snapshotted by the caller before spawning this
@@ -105,7 +114,8 @@ pub(crate) async fn fire_hook(
     extra_env: Vec<(String, String)>,
 ) {
     let handle = tokio::spawn(async move {
-        let pt = load_hook_config(daemon_dir.clone())
+        let record = SUPERVISOR.get_daemon(&daemon_id).await;
+        let pt = load_hook_config(hook_config_root(record.as_ref(), &daemon_dir))
             .await
             .unwrap_or_else(|e| {
                 warn!("Failed to load config for hook '{hook_type}': {e}");
@@ -201,7 +211,8 @@ pub(crate) async fn fire_output_hook(
 ) {
     let handle = tokio::spawn(async move {
         // Render Tera templates in output hook command
-        let pt = load_hook_config(daemon_dir.clone())
+        let record = SUPERVISOR.get_daemon(&daemon_id).await;
+        let pt = load_hook_config(hook_config_root(record.as_ref(), &daemon_dir))
             .await
             .unwrap_or_default();
         let cmd = match render_hook_template(&cmd, &daemon_id, &pt).await {
@@ -323,6 +334,24 @@ async fn render_hook_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hooks_are_read_from_the_project_of_a_daemon_running_elsewhere() {
+        let record = crate::daemon::Daemon {
+            dir: Some(PathBuf::from("/elsewhere")),
+            watch_base_dir: Some(PathBuf::from("/project")),
+            ..Default::default()
+        };
+        assert_eq!(
+            hook_config_root(Some(&record), Path::new("/elsewhere")),
+            PathBuf::from("/project")
+        );
+        // An ad-hoc daemon has no project; its working directory is used.
+        assert_eq!(
+            hook_config_root(None, Path::new("/elsewhere")),
+            PathBuf::from("/elsewhere")
+        );
+    }
 
     #[tokio::test]
     async fn hook_config_is_loaded_from_each_daemon_directory() {
